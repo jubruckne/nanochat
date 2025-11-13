@@ -31,6 +31,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    headwise_attn_output_gate: bool = False
 
 
 def norm(x):
@@ -56,9 +57,14 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.num_query_groups = self.n_head // self.n_kv_head
+        self.headwise_attn_output_gate = getattr(config, "headwise_attn_output_gate", False)
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        q_proj_out_dim = self.n_head * self.head_dim
+        if self.headwise_attn_output_gate:
+            q_proj_out_dim += self.n_head
+        self.c_q = nn.Linear(self.n_embd, q_proj_out_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
@@ -67,7 +73,20 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        gate_score = None
+        q = self.c_q(x)
+        if self.headwise_attn_output_gate:
+            q = q.view(B, T, self.n_kv_head, -1)
+            q, gate = torch.split(
+                q,
+                [self.head_dim * self.num_query_groups, self.num_query_groups],
+                dim=-1,
+            )
+            gate = gate.reshape(B, T, self.n_head, 1)
+            gate_score = gate.permute(0, 2, 1, 3)
+            q = q.reshape(B, T, self.n_head, self.head_dim)
+        else:
+            q = q.view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
@@ -75,7 +94,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
         q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:
@@ -105,6 +126,8 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
+        if gate_score is not None:
+            y = y * torch.sigmoid(gate_score.to(dtype=y.dtype))
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
